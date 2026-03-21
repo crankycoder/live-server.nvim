@@ -169,29 +169,84 @@ local function schedule_reload(inst, changed_path)
     end)
 end
 
--- NOTE: luv has two signatures across versions:
---   start(path, opts_table, cb)  -- modern (expects table)
---   start(path, cb)              -- older (no options)
-local function start_fs_watch(inst)
-    if inst.fs_event then pcall(function() inst.fs_event:stop() end) end
-    inst.fs_event = uv.new_fs_event()
-    local cb = function(err, _fname, _status)
-        if err then return end
-        schedule_reload(inst, _fname or "")
+-- Recursively scan all subdirectories under root (for Linux fallback watchers)
+local function scan_dirs(root)
+    local dirs = { root }
+    local function walk(dir)
+        local handle = uv.fs_scandir(dir)
+        if not handle then return end
+        while true do
+            local name, typ = uv.fs_scandir_next(handle)
+            if not name then break end
+            if typ == "directory" and name ~= ".git" and name ~= "node_modules" then
+                local full = util.joinpath(dir, name)
+                dirs[#dirs + 1] = full
+                walk(full)
+            end
+        end
     end
-    local ok = pcall(function() inst.fs_event:start(inst.root_real, { recursive = true }, cb) end)
+    walk(root)
+    return dirs
+end
+
+-- Attach a single-directory fs_event watcher (Linux fallback)
+local function add_dir_watch(inst, dir, cb)
+    local ev = uv.new_fs_event()
+    local ok = pcall(function() ev:start(dir, {}, cb) end)
     if not ok then
-        -- fallback: non-recursive / legacy signature
-        pcall(function() inst.fs_event:start(inst.root_real, cb) end)
+        pcall(function() ev:start(dir, cb) end)
     end
+    inst._fs_events[dir] = ev
 end
 
 local function stop_fs_watch(inst)
-    if inst.fs_event then pcall(function()
-            inst.fs_event:stop()
-            inst.fs_event:close()
-        end) end
-    inst.fs_event = nil
+    if inst.fs_event then
+        pcall(function() inst.fs_event:stop(); inst.fs_event:close() end)
+        inst.fs_event = nil
+    end
+    if inst._fs_events then
+        for _, ev in pairs(inst._fs_events) do
+            pcall(function() ev:stop(); ev:close() end)
+        end
+        inst._fs_events = nil
+    end
+end
+
+-- NOTE: luv has two signatures across versions:
+--   start(path, opts_table, cb)  -- modern (expects table)
+--   start(path, cb)              -- older (no options)
+-- UV_FS_EVENT_RECURSIVE is only supported on macOS and Windows.
+-- On Linux we fall back to per-directory watchers.
+local function start_fs_watch(inst)
+    stop_fs_watch(inst)
+
+    local cb = function(err, fname, _status)
+        if err then return end
+        schedule_reload(inst, fname or "")
+        -- Linux fallback: watch newly created directories
+        if inst._fs_events and fname and fname ~= "" then
+            local full = util.joinpath(inst.root_real, fname)
+            local st = uv.fs_stat(full)
+            if st and st.type == "directory" and not inst._fs_events[full] then
+                add_dir_watch(inst, full, cb)
+            end
+        end
+    end
+
+    -- Try recursive mode first (macOS/Windows)
+    local single = uv.new_fs_event()
+    local ok = pcall(function() single:start(inst.root_real, { recursive = true }, cb) end)
+    if ok then
+        inst.fs_event = single
+        return
+    end
+    pcall(function() single:close() end)
+
+    -- Fallback: per-directory watchers (Linux)
+    inst._fs_events = {}
+    for _, dir in ipairs(scan_dirs(inst.root_real)) do
+        add_dir_watch(inst, dir, cb)
+    end
 end
 
 -- -------- HTML helpers (injection + templating) ---------------------------
